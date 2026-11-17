@@ -20,7 +20,7 @@ def london_now() -> datetime:
     """Current time as tz-aware Europe/London."""
     return datetime.now(LONDON)
 
-
+# Ensures datetime values associated with a time zone
 def _require_aware(value: datetime, label: str) -> None:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError(f"{label} must be timezone-aware (Europe/London)")
@@ -35,14 +35,24 @@ def _require_whole_minute(value: time, label: str) -> None:
 
 @dataclass(frozen=True)
 class StationRef:
-    """A station. Darwin messages key on TIPLOC, so match on `tiploc`; `crs` is the public 3-letter code for display.
+    """A station, identified by its public 3-letter CRS code.
 
-    One CRS can map to several TIPLOCs. Equality and hashing use `tiploc` only; `crs` is for display.
+    One CRS can map to several TIPLOCs. Equality and hashing use `crs` only; `tiploc` is the Darwin
+    location code (the "tpl" field) and is kept so messages can be matched, but two refs with the same
+    CRS and different TIPLOCs are equal. Darwin messages carry only a TIPLOC, so comparing one against
+    a StationRef by CRS needs a TIPLOC -> CRS lookup in the processing layer.
     Both codes are stripped and upper-cased on creation.
     """
-    tiploc: str  # Darwin location code (the "tpl" field), e.g. "BTHNLGR"
-    crs: str = field(compare=False)  # 3-letter CRS code, e.g. "RDG"; display only
+    tiploc: str = field(compare=False)  # Darwin location code, e.g. "BTHNLGR"
+    crs: str  # 3-letter CRS code, e.g. "RDG"
 
+    """post init validation:
+    1. No whitespace and capitalised
+    2. Frozen: normal assignment fails (object.__setattr__ gets around this)
+    3. Validates tiploc and crs:
+        - tiploc: 1–7 characters, ASCII, letters and digits only.
+        - crs: 3 ASCII characters
+    """
     def __post_init__(self) -> None:
         object.__setattr__(self, "tiploc", self.tiploc.strip().upper())
         object.__setattr__(self, "crs", self.crs.strip().upper())
@@ -73,15 +83,19 @@ class Leg:
 
 @dataclass(frozen=True)
 class WatchedJourney:
-    """A two-leg journey with a single interchange station.
+    """A two-leg journey with one interchange.
+
+    The interchange is either a single station (leg1.destination == leg2.origin) or a walk
+    between two nearby stations (different stations, interchange_walk_mins > 0).
 
     Multiple time slots and return trips are separate WatchedJourney objects.
     """
     id: str
     name: str  # e.g. "Morning 07:42"
-    leg1: Leg  # origin -> interchange
-    leg2: Leg  # interchange -> destination
-    min_connection_mins: int = 5
+    leg1: Leg  # origin -> arrival_station
+    leg2: Leg  # departure_station -> destination
+    min_connection_mins: int = 5  # buffer needed on top of any walk
+    interchange_walk_mins: int = 0  # walking time between arrival_station and departure_station
     days_of_week: frozenset[int] = frozenset({0, 1, 2, 3, 4})  # Mon=0
     valid_from: date | None = None
     valid_to: date | None = None
@@ -100,12 +114,16 @@ class WatchedJourney:
         object.__setattr__(self, "days_of_week", days)  # coerce so the journey stays hashable
         if self.min_connection_mins < 0:
             raise ValueError("min_connection_mins must be >= 0")
+        if self.interchange_walk_mins < 0:
+            raise ValueError("interchange_walk_mins must be >= 0")
         if self.alert_window_mins_before <= 0:
             raise ValueError("alert_window_mins_before must be > 0")
         if self.valid_from and self.valid_to and self.valid_from > self.valid_to:
             raise ValueError("valid_from must not be after valid_to")
-        if self.leg1.destination != self.leg2.origin:
-            raise ValueError("leg1.destination must equal leg2.origin")
+        if self.leg1.destination != self.leg2.origin and self.interchange_walk_mins <= 0:
+            raise ValueError(
+                "leg1.destination must equal leg2.origin unless interchange_walk_mins > 0 (walking interchange)"
+            )
         # Midnight rollover is not supported: all four times must be strictly in order within one day.
         if not (
             self.leg1.scheduled_departure
@@ -114,14 +132,34 @@ class WatchedJourney:
             < self.leg2.scheduled_arrival
         ):
             raise ValueError("journey times must be strictly in order within one day (no midnight rollover)")
+        if self.is_walking_interchange:
+            arr = self.leg1.scheduled_arrival
+            dep = self.leg2.scheduled_departure
+            gap = (dep.hour * 60 + dep.minute) - (arr.hour * 60 + arr.minute)
+            if gap < self.interchange_walk_mins:
+                raise ValueError("scheduled connection gap is shorter than interchange_walk_mins")
         dep = self.leg1.scheduled_departure
         if self.alert_window_mins_before > dep.hour * 60 + dep.minute:
             raise ValueError("alert window must not start before midnight (no midnight rollover)")
 
     @property
-    def interchange(self) -> StationRef:
-        """The single interchange station."""
+    def arrival_station(self) -> StationRef:
+        """Where leg 1 ends."""
         return self.leg1.destination
+
+    @property
+    def departure_station(self) -> StationRef:
+        """Where leg 2 starts (differs from arrival_station for a walking interchange)."""
+        return self.leg2.origin
+
+    @property
+    def is_walking_interchange(self) -> bool:
+        return self.leg1.destination != self.leg2.origin
+
+    @property
+    def required_connection_mins(self) -> int:
+        """Minimum gap between leg 1 arriving and leg 2 departing: walk plus buffer."""
+        return self.interchange_walk_mins + self.min_connection_mins
 
 
 class StopStatus(str, Enum):
@@ -131,6 +169,7 @@ class StopStatus(str, Enum):
     unknown = "unknown"
 
 
+# Stores all the data about a trains stop. 1 instance per station
 @dataclass(frozen=True)
 class TrainStopUpdate:
     """Normalised per-stop update derived from a Darwin train status (TS) message.
@@ -157,6 +196,7 @@ class TrainStopUpdate:
 
     def __post_init__(self) -> None:
         _require_aware(self.received_at, "received_at")
+        object.__setattr__(self, "status", StopStatus(self.status))  # accepts a member or a valid string; else ValueError
         for name in (
             "scheduled_departure", "scheduled_arrival", "estimated_departure",
             "estimated_arrival", "actual_departure", "actual_arrival",
@@ -165,7 +205,7 @@ class TrainStopUpdate:
             if value is not None:
                 _require_whole_minute(value, name)
 
-
+# One stop used within TrainCancellation
 @dataclass(frozen=True)
 class CancellationStop:
     """One location on a train's route, as listed in a Darwin schedule message."""
