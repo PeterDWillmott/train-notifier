@@ -20,7 +20,7 @@ def london_now() -> datetime:
     """Current time as tz-aware Europe/London."""
     return datetime.now(LONDON)
 
-# Ensures datetime values associated with a time zone
+# Ensures a datetime value is timezone-aware
 def _require_aware(value: datetime, label: str) -> None:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError(f"{label} must be timezone-aware (Europe/London)")
